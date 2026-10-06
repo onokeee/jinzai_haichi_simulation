@@ -4,10 +4,11 @@
 NANDフラッシュメモリ工場（製品の世代ごとに3つのライン）を題材に、
 過去の実績データ（スキル別の担当人数・不良数・稼働率）から
 「担当を増やすと、不良や装置停止がどれくらい減るか」をラインごとに学習し、
-生産数（または金額）が最大になる人員配置を計算します。
+すべての配置を計算して、生産数（または金額）が最大になる人員配置を求めます。
 
 起動:  streamlit run app.py
 """
+import itertools
 import math
 
 import numpy as np
@@ -26,7 +27,8 @@ SKILL_NAMES = list(SKILLS.keys())
 SKILL_FACTORS = np.array(list(SKILLS.values()))
 SKILL_COLORS = {"新人": "#9ecae1", "中堅": "#3182bd", "ベテラン": "#08519c"}
 MIN_PER_LINE = 1  # 各ラインに最低1人は配置する
-MAX_PER_SKILL = 10  # スキルごとの人数の上限（合計30人まで。計算時間を短く保つため）
+MAX_PER_SKILL = 10  # スキルごとの人数の上限（配置の組み合わせが多くなりすぎないように）
+MAX_DRAW = 8000  # グラフに描く配置の線の上限（これより多いときは抜き出して描く）
 DEFAULT_STAFF = {"新人": 4, "中堅": 8, "ベテラン": 3}
 DEFAULT_PRICES = {"第1世代": 60, "第2世代": 100, "第3世代": 150}  # ウエハ1枚の単価（万円）
 
@@ -129,41 +131,59 @@ def simulate_line(p, work):
     }
 
 
+# ---------------------------------------------------------------------------
+# 配置の全通りを計算
+# ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def solve_all(params: pd.DataFrame, total: int, objective: str):
-    """動的計画法：ラインを1本ずつ増やしながら、合計 total 人以下のすべての人員構成
-    （新人, 中堅, ベテラン）について「生産数（または金額）が最大になる配置」を一度に求める。
-    全通りを調べたのと同じ、本当に一番よい答えになる。"""
-    recs = params.to_dict("records")
-    shape = (total + 1,) * len(SKILL_NAMES)
-    # 1ラインに置く人数の組（新人, 中堅, ベテラン）
-    choices = np.array([d for d in np.ndindex(*shape) if MIN_PER_LINE <= sum(d) <= total])
-    best = np.full(shape, -np.inf)  # best[u] = これまでのラインに u 人を使ったときの最大値
-    best[(0,) * len(shape)] = 0.0
-    picks = []
-    for p in recs:
-        gains = simulate_line(p, choices @ SKILL_FACTORS)[objective]
-        new, pick = np.full(shape, -np.inf), np.zeros(shape, dtype=int)
-        for j, (d, gain) in enumerate(zip(choices, gains)):
-            dst = tuple(slice(k, None) for k in d)
-            src = tuple(slice(0, n - k) for n, k in zip(shape, d))
-            cand = best[src] + gain
-            better = cand > new[dst]
-            new[dst][better] = cand[better]
-            pick[dst][better] = j
-        best = new
-        picks.append(pick)
-    return best, picks, choices
+def all_allocations(staff: tuple, n_lines: int) -> np.ndarray:
+    """スキル別の人数 staff を各ラインに配置するすべての方法（各ライン1人以上）。形は（通り, ライン, スキル）"""
+    splits = [np.array([c for c in itertools.product(range(s + 1), repeat=n_lines) if sum(c) == s], dtype=np.int16)
+              for s in staff]  # スキルごとの「各ラインへの分け方」
+    grids = np.meshgrid(*[np.arange(len(sp)) for sp in splits], indexing="ij")
+    allocs = np.stack([sp[g.ravel()] for sp, g in zip(splits, grids)], axis=2)
+    return allocs[(allocs.sum(axis=2) >= MIN_PER_LINE).all(axis=1)]
 
 
-def backtrack(picks, choices, team) -> np.ndarray:
-    """最後のラインから順に、選んだ人数の組をたどって配置を復元"""
-    alloc = np.zeros((len(picks), len(SKILL_NAMES)), dtype=int)
-    u = tuple(team)
-    for i in range(len(picks) - 1, -1, -1):
-        alloc[i] = choices[picks[i][u]]
-        u = tuple(np.subtract(u, alloc[i]))
-    return alloc
+def allocation_values(params: pd.DataFrame, allocs: np.ndarray, metric: str) -> np.ndarray:
+    """配置ごとの、工場全体の生産数（または金額）"""
+    work = allocs @ SKILL_FACTORS  # （通り, ライン）
+    return sum(simulate_line(p, work[:, i])[metric] for i, p in enumerate(params.to_dict("records")))
+
+
+@st.cache_data(show_spinner=False)
+def evaluate_all(params: pd.DataFrame, staff: tuple, metric: str):
+    allocs = all_allocations(staff, len(params))
+    return allocs, allocation_values(params, allocs, metric)
+
+
+def growth_values(params: pd.DataFrame, allocs: np.ndarray, metric: str) -> np.ndarray:
+    """配置ごとに、まず各ラインに1人ずつ置き、そこから同じ比率を保ちながら1人ずつ増やしたときの値
+    （ライン数の人数〜全員）。形は（通り, 人数）"""
+    n, (lines, skills) = len(allocs), allocs.shape[1:]
+    total = int(allocs[0].sum())
+    rows = np.arange(n)
+    counts = np.zeros(allocs.shape)
+    for i in range(lines):  # 各ラインの最初の1人は、そのラインで一番多いスキルの人
+        counts[rows, i, allocs[:, i, :].argmax(axis=1)] = 1
+    counts = counts.reshape(n, -1)
+    target = allocs.reshape(n, -1).astype(float)
+    out = [allocation_values(params, counts.reshape(n, lines, skills), metric)]
+    for x in range(lines + 1, total + 1):
+        counts[rows, (x * target / total - counts).argmax(axis=1)] += 1  # 比率に一番足りない所へ1人
+        out.append(allocation_values(params, counts.reshape(n, lines, skills), metric))
+    return np.array(out).T
+
+
+@st.cache_data(show_spinner=False)
+def fan_curves(params: pd.DataFrame, staff: tuple, metric: str):
+    """グラフ用：配置ごとの線（多いときは抜き出し）と、一番よい配置・一番わるい配置の線"""
+    allocs, values = evaluate_all(params, staff, metric)
+    draw = np.arange(len(allocs))
+    if len(draw) > MAX_DRAW:
+        draw = np.random.default_rng(0).choice(draw, MAX_DRAW, replace=False)
+    picks = np.concatenate([draw, [values.argmax(), values.argmin()]])
+    curves = growth_values(params, allocs[picks], metric)
+    return curves[:-2], curves[-2], curves[-1]
 
 
 def result_table(params: pd.DataFrame, alloc: np.ndarray) -> pd.DataFrame:
@@ -175,96 +195,66 @@ def result_table(params: pd.DataFrame, alloc: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def count_allocations(staff: dict, n_lines: int) -> float:
-    """スキル別の人数を n ラインに割り振る方法の数（各ライン1人以上）"""
-    f = np.zeros([staff[s] + 1 for s in SKILL_NAMES])
-    f[(0,) * f.ndim] = 1.0
-    for _ in range(n_lines):
-        g = f
-        for ax in range(f.ndim):
-            g = g.cumsum(axis=ax)
-        f = g - f  # 前のラインまでの割り振り ＋ このラインに1人以上
-    return float(f[(-1,) * f.ndim])
-
-
-def growth_path(comp) -> list:
-    """内訳 comp と同じ比率を保ちながら1人ずつ増やしたときの、1人目〜全員のチーム"""
-    total = sum(comp)
-    counts = [0] * len(comp)
-    path = []
-    for x in range(1, total + 1):
-        s = max(range(len(comp)), key=lambda j: x * comp[j] / total - counts[j])  # 比率に一番足りないスキル
-        counts[s] += 1
-        path.append(tuple(counts))
-    return path
-
-
 def team_label(team) -> str:
-    return "・".join(f"{s}{n}" for s, n in zip(SKILL_NAMES, team))
+    return "・".join(f"{s}{int(n)}" for s, n in zip(SKILL_NAMES, team) if n)
 
 
-def composition_figure(best, comps, current, x_min: int, metric: str) -> go.Figure:
-    """内訳ごとに、同じ比率で人数を増やしたときの最大値の折れ線（細線＝全通り、太線＝一番よい内訳と今の内訳）"""
+def alloc_label(alloc, lines) -> str:
+    return "／".join(f"{line}：{team_label(row)}" for line, row in zip(lines, alloc))
+
+
+# ---------------------------------------------------------------------------
+# グラフ
+# ---------------------------------------------------------------------------
+def fan_figure(thin, best_y, worst_y, best_alloc, worst_alloc, lines, metric: str, x_min: int, n_total: int):
+    """配置ごとに、同じ比率で人数を増やしたときの折れ線（細線＝配置の全通り、太線＝一番よい・一番わるい配置）"""
     unit, scale, fmt = UNITS[metric]
-    xs = list(range(x_min, sum(current) + 1))
-
-    def series(comp):
-        path = growth_path(comp)
-        return [best[path[x - 1]] * scale for x in xs]
-
-    gx, gy, gt = [], [], []
-    for comp in comps:
-        gx += xs + [None]
-        gy += series(comp) + [None]
-        gt += [team_label(comp)] * len(xs) + [None]
+    xs = np.arange(x_min, x_min + thin.shape[1])
+    shown = f"全{n_total:,}通り" if len(thin) == n_total else f"全{n_total:,}通りのうち{len(thin):,}通り"
     fig = go.Figure()
-    fig.add_scatter(x=gx, y=gy, text=gt, mode="lines", name=f"内訳ごとの線（全{len(comps)}通り）",
-                    line=dict(color="rgba(140,140,140,0.35)", width=1),
-                    hovertemplate="%{text}<br>%{x}人 → %{y:" + fmt + "} " + unit + "<extra></extra>")
-    top = max(comps, key=lambda c: best[c])
-    for comp, name, color in ((top, "一番よい内訳", "#2ca02c"), (current, "今の内訳", "#ff7f0e")):
-        fig.add_scatter(x=xs, y=series(comp), mode="lines+markers", name=f"{name}（{team_label(comp)}）",
-                        line=dict(color=color, width=4), marker=dict(size=6),
-                        hovertemplate=name + "<br>%{x}人 → %{y:" + fmt + "} " + unit + "<extra></extra>")
+    fig.add_trace(go.Scattergl(  # 線ごとにNaNで区切って、1本のトレースにまとめて描く
+        x=np.tile(np.append(xs, np.nan), len(thin)),
+        y=np.hstack([thin * scale, np.full((len(thin), 1), np.nan)]).ravel(),
+        mode="lines", name=f"配置ごとの線（{shown}）", hoverinfo="skip",
+        line=dict(color="rgba(120,120,120,0.05)", width=1)))
+    for ys, alloc, name, color in ((best_y, best_alloc, "一番よい配置", "#2ca02c"),
+                                   (worst_y, worst_alloc, "一番わるい配置", "#d62728")):
+        fig.add_trace(go.Scattergl(  # 細い線と同じ層に描いて、上に重ねる
+            x=xs, y=ys * scale, mode="lines+markers", line=dict(color=color, width=4),
+            marker=dict(size=7), name=f"{name}（{alloc_label(alloc, lines)}）",
+            hovertemplate=f"{name}<br>" + "%{x}人 → %{y:" + fmt + "} " + unit + "<extra></extra>"))
     fig.update_layout(height=480, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=-0.15),
                       xaxis=dict(title="人数（人）", dtick=1), yaxis=dict(title=f"{metric}（{unit}）"))
     return fig
 
 
-def relation_figure(hist: pd.DataFrame, params: pd.DataFrame) -> go.Figure:
-    """ラインごとに「担当人数 × 生産数」の散布図（実績）と、学習した傾向の線"""
+def relation_figure(hist: pd.DataFrame, params: pd.DataFrame, metric: str) -> go.Figure:
+    """ラインごとに「担当人数 × 不良数（または生産数）」の散布図（実績）と、学習した傾向の線"""
     recs = params.to_dict("records")
     cols = min(3, len(recs))
     rows = math.ceil(len(recs) / cols)
+    color = BREAKDOWN_COLORS[metric]
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=[p["世代"] for p in recs],
                         horizontal_spacing=0.07, vertical_spacing=0.16)
     for i, p in enumerate(recs):
         r, c = i // cols + 1, i % cols + 1
         g = hist[hist["世代"] == p["世代"]]
         people = g[SKILL_NAMES].sum(axis=1)
-        produced = g["投入数"] * g["稼働率(%)"] / 100 - g["不良数"]  # 実績の生産数
+        actual = g["不良数"] if metric == "不良数" else g["投入数"] * g["稼働率(%)"] / 100 - g["不良数"]
         xs = np.arange(1, max(int(people.max()) + 2, 6) + 1)
-        fig.add_scatter(x=people, y=produced, mode="markers", name="実績（1点＝1か月）",
-                        marker=dict(color="#7f7f7f", size=8, opacity=0.55),
-                        customdata=g["年月"], hovertemplate="%{customdata}<br>担当 %{x}人<br>生産 %{y:,.0f}枚<extra></extra>",
+        fig.add_scatter(x=people, y=actual, mode="markers", name="実績（1点＝1か月）",
+                        marker=dict(color="#7f7f7f", size=8, opacity=0.55), customdata=g["年月"],
+                        hovertemplate="%{customdata}<br>担当 %{x}人<br>%{y:,.0f}枚<extra></extra>",
                         legendgroup="実績", showlegend=(i == 0), row=r, col=c)
-        trend = [simulate_line(p, n * p["1人あたりの量"])["生産数"] for n in xs]
-        fig.add_scatter(x=xs, y=trend, mode="lines", name="学習した傾向", line=dict(color="#2ca02c", width=3),
-                        hovertemplate="担当 %{x}人 → 生産 約 %{y:,.0f}枚<extra></extra>",
+        trend = [simulate_line(p, n * p["1人あたりの量"])[metric] for n in xs]
+        fig.add_scatter(x=xs, y=trend, mode="lines", name="学習した傾向", line=dict(color=color, width=3),
+                        hovertemplate="担当 %{x}人 → 約 %{y:,.0f}枚<extra></extra>",
                         legendgroup="傾向", showlegend=(i == 0), row=r, col=c)
     fig.update_xaxes(title_text="担当人数（人）", dtick=1)
-    fig.update_yaxes(title_text="生産数（枚/月）")
+    fig.update_yaxes(title_text=f"{metric}（枚/月）", rangemode="tozero" if metric == "不良数" else "normal")
     fig.update_layout(height=300 * rows + 40, margin=dict(l=0, r=0, t=80, b=0),
                       legend=dict(orientation="h", yref="container", yanchor="top", y=0.99, x=0))
     return fig
-
-
-def fmt_count(c: float) -> str:
-    for unit, name in ((1e16, "京"), (1e12, "兆"), (1e8, "億"), (1e4, "万")):
-        if c >= unit:
-            v = c / unit
-            return f"約{v:,.1f}{name}通り" if v < 10 else f"約{v:,.0f}{name}通り"
-    return f"{c:,.0f}通り"
 
 
 def fmt_int(v):
@@ -303,9 +293,10 @@ if total_staff < MIN_PER_LINE * n_lines:
     st.error(f"人数が足りません：{n_lines} ラインに最低1人ずつ、{MIN_PER_LINE * n_lines} 人以上が必要です。")
     st.stop()
 
-with st.spinner("最適な配置を計算中…"):
-    best, picks, choices = solve_all(params, total_staff, metric)
-res = result_table(params, backtrack(picks, choices, current))
+with st.spinner("すべての配置を計算中…"):
+    allocs, values = evaluate_all(params, current, metric)
+best_i, worst_i = int(values.argmax()), int(values.argmin())
+res = result_table(params, allocs[best_i])
 
 cards = [("生産数（枚/月）", fmt_int(res["生産数"].sum())),
          ("不良数（枚/月）", fmt_int(res["不良数"].sum())),
@@ -314,8 +305,8 @@ if metric == "金額":
     cards.insert(0, ("金額（億円/月）", f"{res['金額'].sum() / 1e4:,.1f}"))
 for col, (label, value) in zip(st.columns(len(cards)), cards):
     col.metric(label, value)
-st.caption(f"💡 人の配置のしかたは全部で {fmt_count(count_allocations(staff, n_lines))}。"
-           f"その中から、{metric}が最大になる配置をコンピュータが探し出しました。")
+st.caption(f"💡 人の配置のしかたは全部で {len(allocs):,}通り。"
+           f"コンピュータがそのすべてを計算し、{metric}が最大になる配置を見つけました。")
 
 left, right = st.columns(2)
 with left:
@@ -337,13 +328,16 @@ with right:
     fig.update_yaxes(autorange="reversed")
     st.plotly_chart(fig, use_container_width=True)
 
-comps = [(a, b, total_staff - a - b) for a in range(total_staff + 1) for b in range(total_staff + 1 - a)]
-st.markdown(f"**📈 人数と{metric}の関係（{total_staff}人の内訳 全{len(comps)}通り）**")
-st.plotly_chart(composition_figure(best, comps, current, n_lines, metric), use_container_width=True)
-st.caption(f"細い線は、新人・中堅・ベテランの内訳ごとに、同じ比率のまま人数を増やしたときの{metric}"
-           "（各人数で一番よい配置にした場合）。人数を増やすと伸びがだんだん小さくなり、やがて頭打ちになります。")
+st.markdown(f"**📈 人数と{metric}の関係（{team_label(current)} の配置 全{len(allocs):,}通り）**")
+thin, best_y, worst_y = fan_curves(params, current, metric)
+st.plotly_chart(fan_figure(thin, best_y, worst_y, allocs[best_i], allocs[worst_i], lines, metric,
+                           n_lines, len(allocs)), use_container_width=True)
+sampled = f"（多いため{len(thin):,}通りを抜き出して表示）" if len(thin) < len(allocs) else ""
+st.caption(f"細い線は、設定した{total_staff}人を{n_lines}つのラインに配置する方法ごとに、同じ配置の比率のまま"
+           f"人数を増やしたときの{metric}{sampled}。緑は一番よい配置、赤は一番わるい配置です。"
+           "人数を増やすと伸びがだんだん小さくなり、やがて頭打ちになります。")
 
-st.markdown("**📋 ラインごとの詳細**")
+st.markdown("**📋 ラインごとの詳細（一番よい配置）**")
 show = res[["世代", "装置台数", *SKILL_NAMES, "合計人数", "稼働率", "不良率", *BREAKDOWN_COLORS]].copy()
 show["稼働率"] *= 100
 show["不良率"] *= 100
@@ -354,7 +348,11 @@ if metric == "金額":
 st.dataframe(show.style.format(formats), hide_index=True, use_container_width=True)
 st.caption("生産数 ＝ 投入数 − 停止で作れなかった数 − 不良数。稼働率・不良率は実績から学習した予想値です。")
 
-with st.expander("📊 もとにした実績データ：担当人数と生産数の関係"):
-    st.plotly_chart(relation_figure(hist, params), use_container_width=True)
+with st.expander("📊 もとにした実績データ：担当人数と不良数・生産数の関係"):
+    st.markdown("**担当人数と不良数**")
+    st.plotly_chart(relation_figure(hist, params, "不良数"), use_container_width=True)
+    st.markdown("**担当人数と生産数**")
+    st.plotly_chart(relation_figure(hist, params, "生産数"), use_container_width=True)
     st.caption("灰色の点 ＝ 過去の実績（1点が1か月）、線 ＝ 実績から学習した傾向。"
-               "担当が多い月ほど生産数が多く、ある人数を超えると増え方が小さくなる、という関係をもとに計算しています。")
+               "担当が少ない月ほど不良が多く、生産数が少ない。担当を増やすと、ある人数で生産数が頭打ちになる、"
+               "という関係をもとに計算しています。")
